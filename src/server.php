@@ -11,7 +11,6 @@ class PdfImageServer
   private Server $server;
   private PdfConverter $converter;
   private string $uploadDir;
-  // Add properties for URL parts
   private string $appUrlScheme;
   private string $appUrlHost;
   private int $appUrlPort;
@@ -20,13 +19,11 @@ class PdfImageServer
   {
     $this->uploadDir = getenv('UPLOAD_DIR') ?: __DIR__ . '/uploads';
     $this->converter = new PdfConverter($this->uploadDir);
-    $this->server = new Server($host, $port); // This is the internal server binding
+    $this->server = new Server($host, $port);
 
-    // --- Read base URL parts from environment variables ---
     $this->appUrlScheme = getenv('APP_URL_SCHEME') ?: 'http';
-    $this->appUrlHost = getenv('APP_URL_HOST') ?: $host; // Default to internal host if not set
-    $this->appUrlPort = (int)(getenv('APP_URL_PORT') ?: $port); // Default to internal port if not set
-    // -----------------------------------------------------
+    $this->appUrlHost = getenv('APP_URL_HOST') ?: $host;
+    $this->appUrlPort = (int)(getenv('APP_URL_PORT') ?: $port);
 
     $this->configureServer();
   }
@@ -39,7 +36,7 @@ class PdfImageServer
       'document_root' => $this->uploadDir,
       'enable_static_handler' => true,
       'http_parse_post' => true,
-      'package_max_length' => 50 * 1024 * 1024, // 50MB
+      'package_max_length' => 50 * 1024 * 1024,
     ]);
 
     $this->server->on('start', [$this, 'onStart']);
@@ -49,7 +46,6 @@ class PdfImageServer
 
   public function onStart(Server $server): void
   {
-    // Output the actual accessible URL for clarity
     echo sprintf(
       "PDF to Image service started. Internally listening at http://%s:%d. Accessible base URL for downloads: %s://%s:%d\n",
       $server->host,
@@ -64,25 +60,28 @@ class PdfImageServer
   {
     echo "Worker #{$workerId} started\n";
 
-    // Initialize any worker-specific resources here
     if (!file_exists($this->uploadDir) && !mkdir($concurrentDirectory = $this->uploadDir, 0777, true) && !is_dir($concurrentDirectory)) {
       throw new \RuntimeException(sprintf('Directory "%s" was not created', $concurrentDirectory));
+    }
+
+    $tempDir = $this->uploadDir . '/temp';
+    if (!is_dir($tempDir)) {
+        if (!mkdir($tempDir, 0777, true) && !is_dir($tempDir)) {
+            throw new \RuntimeException(sprintf('Directory "%s" was not created', $tempDir));
+        }
     }
   }
 
   public function onRequest(Request $request, Response $response): void
   {
-    // Enable CORS (adjust as needed for your environment)
     $this->setCorsHeaders($response);
 
-    // Handle preflight requests
     if ($request->server['request_method'] === 'OPTIONS') {
       $response->status(200);
       $response->end();
       return;
     }
 
-    // Route requests
     try {
       $path = $request->server['request_uri'] ?? '/';
 
@@ -105,14 +104,12 @@ class PdfImageServer
 
   private function handleConvertRequest(Request $request, Response $response): void
   {
-    // Validate request
     if (empty($request->files['pdf_file'])) {
       throw new InvalidArgumentException('No PDF file uploaded');
     }
 
     $uploadedFile = $request->files['pdf_file'];
 
-    // Validate upload
     if ($uploadedFile['error'] !== UPLOAD_ERR_OK) {
       throw new RuntimeException(sprintf(
         'File upload error: %s',
@@ -120,48 +117,89 @@ class PdfImageServer
       ));
     }
 
-    // Validate file type
+    // Sanitize the original filename
+    $originalFilename = $uploadedFile['name'];
+    $sanitizedOriginalFilename = preg_replace('/[^A-Za-z0-9\._-]/', '', basename($originalFilename));
+    if (empty($sanitizedOriginalFilename) || $sanitizedOriginalFilename === '.pdf') {
+        $sanitizedOriginalFilename = 'uploaded_file.pdf'; // Fallback filename
+    }
+    if (strtolower(pathinfo($sanitizedOriginalFilename, PATHINFO_EXTENSION)) !== 'pdf') {
+      $sanitizedOriginalFilename .= '.pdf';
+    }
+
+    $filenameNoExt = pathinfo($sanitizedOriginalFilename, PATHINFO_FILENAME);
+
+    // Validate MIME type using the temporary uploaded file
     $mimeType = mime_content_type($uploadedFile['tmp_name']);
     if ($mimeType !== 'application/pdf') {
       throw new InvalidArgumentException(
-        'Invalid file type. Only PDF files are allowed'
+        'Invalid file type. Only PDF files are allowed. Detected: ' . $mimeType
       );
     }
 
-    // Validate file size (10MB limit)
-    $maxSize = 10 * 1024 * 1024;
+    // Validate file size
+    $maxSize = 10 * 1024 * 1024; // 10MB
     if ($uploadedFile['size'] > $maxSize) {
       throw new InvalidArgumentException(
         sprintf('File too large. Maximum size is %dMB', $maxSize / 1024 / 1024)
       );
     }
 
-    // Process in coroutine to avoid blocking
-    Coroutine::create(function () use ($uploadedFile, $request, $response) { // Added $request here
+    // Move uploaded file to uploads/temp
+    $tmpDir = $this->uploadDir . '/temp';
+    if (!is_dir($tmpDir) && !mkdir($tmpDir, 0777, true) && !is_dir($tmpDir)) {
+        throw new \RuntimeException(sprintf('Directory "%s" was not created', $tmpDir));
+    }
+    $persistedFilePath = $tmpDir . '/' . $sanitizedOriginalFilename;
+
+    if (!move_uploaded_file($uploadedFile['tmp_name'], $persistedFilePath)) {
+        throw new RuntimeException('Failed to move uploaded file to permanent location.');
+    }
+
+    // Determine output type (blob or base64)
+    $output = "blob"; // Default output type
+    if (
+      isset($request->header['content-type']) &&
+      strpos($request->header['content-type'], 'application/json') !== false
+    ) {
+        $data = json_decode($request->rawContent(), true);
+        $output = $data['output'] ?? $request->post['output'] ?? "blob";
+    } else {
+        $output = $request->post['output'] ?? "blob";
+    }
+
+    Coroutine::create(function () use ($persistedFilePath, $filenameNoExt, $response, $output, $originalFilename) {
       try {
+        // Use the path to the file now in uploads/temp
         $result = $this->converter->convertToImages(
-          $uploadedFile['tmp_name'],
-          pathinfo($uploadedFile['name'], PATHINFO_FILENAME),
-          $request->post['quality'] ?? 90
+          $persistedFilePath,
+          $filenameNoExt, // Pass the sanitized base filename
+          $output          // Pass the desired output type ("blob" or "base64")
         );
 
-        // --- Construct baseUrl using environment variables ---
         $baseUrl = sprintf(
           '%s://%s:%d/download/',
           $this->appUrlScheme,
           $this->appUrlHost,
           $this->appUrlPort
         );
-        // --------------------------------------------------
+
+        $imagesData = [];
+        if ($output === "base64") {
+            $imagesData = $result; // Result is already an array of base64 strings
+        } else {
+            $imagesData = array_map(
+                fn($img) => $baseUrl . $img, // Result is an array of filenames
+                $result
+            );
+        }
 
         $responseData = [
           'success' => true,
-          'original_name' => $uploadedFile['name'],
+          'original_name' => $originalFilename,
           'pages' => count($result),
-          'images' => array_map(
-            fn($img) => $baseUrl . $img,
-            $result
-          ),
+          'images' => $imagesData,
+          'output_type' => $output,
           'timestamp' => time(),
         ];
 
@@ -171,59 +209,95 @@ class PdfImageServer
       } catch (Throwable $e) {
         $this->handleError($response, $e);
       }
+      // The file at $persistedFilePath in uploads/temp will be kept
+      // as there's no unlink operation here.
     });
   }
 
   private function handleFetchAndConvertRequest(Request $request, Response $response): void
   {
+    $output = "blob";
     if (
       isset($request->header['content-type']) &&
       strpos($request->header['content-type'], 'application/json') !== false
     ) {
       $data = json_decode($request->rawContent(), true);
       $url = $data['url'] ?? null;
+      $output = $data['output'] ?? "blob";
     } else {
       $url = $request->post['url'] ?? null;
+      $output = $request->post['output'] ?? "blob";
     }
 
     if (!$url || !filter_var($url, FILTER_VALIDATE_URL)) {
       throw new InvalidArgumentException('A valid URL must be provided');
     }
 
-    // Download the file to a temp location
-    $tmpFile = tempnam(sys_get_temp_dir(), 'pdf_');
-    $headers = get_headers($url, 1);
-    $filename = basename(parse_url($url, PHP_URL_PATH));
-    if (isset($headers['Content-Disposition']) && preg_match('/filename="?([^"]+)"?/i', $headers['Content-Disposition'], $matches)) {
-      $filename = pathinfo($matches[1], PATHINFO_FILENAME);
+    $tmpDir = $this->uploadDir . '/temp';
+    if (!is_dir($tmpDir) && !mkdir($tmpDir, 0777, true) && !is_dir($tmpDir)) {
+      throw new \RuntimeException(sprintf('Directory "%s" was not created', $tmpDir));
     }
+
+    $headers = @get_headers($url, 1);
+    $filename = basename(parse_url($url, PHP_URL_PATH));
+
+    if (isset($headers['Content-Disposition'])) {
+        if (is_array($headers['Content-Disposition'])) {
+            foreach ($headers['Content-Disposition'] as $cdHeader) {
+                if (preg_match('/filename="?([^"]+)"?/i', $cdHeader, $matches)) {
+                    $filename = $matches[1];
+                    break;
+                }
+            }
+        } elseif (preg_match('/filename="?([^"]+)"?/i', $headers['Content-Disposition'], $matches)) {
+            $filename = $matches[1];
+        }
+    }
+
+    $filename = preg_replace('/[^A-Za-z0-9\._-]/', '', $filename);
+    if (empty($filename) || $filename === '.pdf') {
+        $filename = 'downloaded_file.pdf';
+    }
+    if (strtolower(pathinfo($filename, PATHINFO_EXTENSION)) !== 'pdf') {
+      $filename .= '.pdf';
+    }
+
+    $fullTmpPath = $tmpDir . '/' . $filename;
+
     $fileContent = @file_get_contents($url);
     if ($fileContent === false) {
-      throw new RuntimeException('Failed to download file from URL');
+      throw new RuntimeException('Failed to download file from URL: ' . $url);
     }
-    file_put_contents($tmpFile, $fileContent);
+    if (file_put_contents($fullTmpPath, $fileContent) === false) {
+        throw new RuntimeException('Failed to write downloaded file to: ' . $fullTmpPath);
+    }
 
-    // Validate file type
-    $mimeType = mime_content_type($tmpFile);
+    $mimeType = mime_content_type($fullTmpPath);
     if ($mimeType !== 'application/pdf') {
-      unlink($tmpFile);
-      throw new InvalidArgumentException('Downloaded file is not a valid PDF');
+      if (file_exists($fullTmpPath)) {
+        unlink($fullTmpPath);
+      }
+      throw new InvalidArgumentException('Downloaded file is not a valid PDF. Detected MIME type: ' . $mimeType);
     }
 
-    // Validate file size (10MB limit)
     $maxSize = 10 * 1024 * 1024;
-    if (filesize($tmpFile) > $maxSize) {
-      unlink($tmpFile);
+    if (filesize($fullTmpPath) > $maxSize) {
+      if (file_exists($fullTmpPath)) {
+        unlink($fullTmpPath);
+      }
       throw new InvalidArgumentException(
         sprintf('File too large. Maximum size is %dMB', $maxSize / 1024 / 1024)
       );
     }
 
-    Coroutine::create(function () use ($filename, $tmpFile, $response, $url) {
+    $filenameNoExt = pathinfo($filename, PATHINFO_FILENAME);
+
+    Coroutine::create(function () use ($filenameNoExt, $fullTmpPath, $response, $url, $output) {
       try {
         $result = $this->converter->convertToImages(
-          $tmpFile,
-          $filename
+          $fullTmpPath,
+          $filenameNoExt,
+          $output
         );
 
         $baseUrl = sprintf(
@@ -233,14 +307,22 @@ class PdfImageServer
           $this->appUrlPort
         );
 
+        $imagesData = [];
+        if ($output === "base64") {
+            $imagesData = $result;
+        } else {
+            $imagesData = array_map(
+                static fn($img) => $baseUrl . $img,
+                $result
+            );
+        }
+
         $responseData = [
           'success' => true,
           'source_url' => $url,
           'pages' => count($result),
-          'images' => array_map(
-            static fn($img) => $baseUrl . $img,
-            $result
-          ),
+          'images' => $imagesData,
+          'output_type' => $output,
           'timestamp' => time(),
         ];
 
@@ -248,10 +330,6 @@ class PdfImageServer
         $response->end(json_encode($responseData));
       } catch (Throwable $e) {
         $this->handleError($response, $e);
-      } finally {
-        if (file_exists($tmpFile)) {
-          unlink($tmpFile);
-        }
       }
     });
   }
@@ -342,6 +420,5 @@ class PdfImageServer
   }
 }
 
-// Start the server
 $server = new PdfImageServer();
 $server->start();

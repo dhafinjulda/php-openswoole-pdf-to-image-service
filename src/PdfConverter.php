@@ -13,7 +13,7 @@ class PdfConverter
     }
   }
 
-  public function convertToImages(string $pdfPath, string $filename): array
+  public function convertToImages(string $pdfPath, string $filename, string $output = "blob"): array
   {
     if (!extension_loaded('imagick')) {
       throw new RuntimeException('Imagick extension is not installed');
@@ -28,12 +28,17 @@ class PdfConverter
       $imagick->setImageCompressionQuality(100);
 
       foreach ($imagick as $i => $page) {
-        $outputPath = "{$this->uploadDir}/{$filename}.png";
-        if (count($imagick)>1) {
-          $outputPath = "{$this->uploadDir}/{$filename}-{$i}.png";
+        if ($output === "base64") {
+          // Get image blob and encode directly to base64
+          $outputImages[] = base64_encode($page->getImageBlob());
+        } else {
+          $outputPath = "{$this->uploadDir}/{$filename}.png";
+          if (count($imagick)>1) {
+            $outputPath = "{$this->uploadDir}/{$filename}-{$i}.png";
+          }
+          $page->writeImage($outputPath);
+          $outputImages[] = basename($outputPath);
         }
-        $page->writeImage($outputPath);
-        $outputImages[] = basename($outputPath);
       }
 
       $imagick->clear();
