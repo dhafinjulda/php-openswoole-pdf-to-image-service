@@ -88,6 +88,8 @@ class PdfImageServer
 
       if ($path === '/convert' && $request->server['request_method'] === 'POST') {
         $this->handleConvertRequest($request, $response);
+      } elseif ($path === '/fetch-and-convert' && $request->server['request_method'] === 'POST') {
+        $this->handleFetchAndConvertRequest($request, $response);
       } elseif (strpos($path, '/download/') === 0) {
         $this->handleDownloadRequest($request, $response);
       } elseif ($path === '/health') {
@@ -139,7 +141,7 @@ class PdfImageServer
       try {
         $result = $this->converter->convertToImages(
           $uploadedFile['tmp_name'],
-          $request->post['dpi'] ?? 150,
+          pathinfo($uploadedFile['name'], PATHINFO_FILENAME),
           $request->post['quality'] ?? 90
         );
 
@@ -168,6 +170,88 @@ class PdfImageServer
 
       } catch (Throwable $e) {
         $this->handleError($response, $e);
+      }
+    });
+  }
+
+  private function handleFetchAndConvertRequest(Request $request, Response $response): void
+  {
+    if (
+      isset($request->header['content-type']) &&
+      strpos($request->header['content-type'], 'application/json') !== false
+    ) {
+      $data = json_decode($request->rawContent(), true);
+      $url = $data['url'] ?? null;
+    } else {
+      $url = $request->post['url'] ?? null;
+    }
+
+    if (!$url || !filter_var($url, FILTER_VALIDATE_URL)) {
+      throw new InvalidArgumentException('A valid URL must be provided');
+    }
+
+    // Download the file to a temp location
+    $tmpFile = tempnam(sys_get_temp_dir(), 'pdf_');
+    $headers = get_headers($url, 1);
+    $filename = basename(parse_url($url, PHP_URL_PATH));
+    if (isset($headers['Content-Disposition']) && preg_match('/filename="?([^"]+)"?/i', $headers['Content-Disposition'], $matches)) {
+      $filename = pathinfo($matches[1], PATHINFO_FILENAME);
+    }
+    $fileContent = @file_get_contents($url);
+    if ($fileContent === false) {
+      throw new RuntimeException('Failed to download file from URL');
+    }
+    file_put_contents($tmpFile, $fileContent);
+
+    // Validate file type
+    $mimeType = mime_content_type($tmpFile);
+    if ($mimeType !== 'application/pdf') {
+      unlink($tmpFile);
+      throw new InvalidArgumentException('Downloaded file is not a valid PDF');
+    }
+
+    // Validate file size (10MB limit)
+    $maxSize = 10 * 1024 * 1024;
+    if (filesize($tmpFile) > $maxSize) {
+      unlink($tmpFile);
+      throw new InvalidArgumentException(
+        sprintf('File too large. Maximum size is %dMB', $maxSize / 1024 / 1024)
+      );
+    }
+
+    Coroutine::create(function () use ($filename, $tmpFile, $response, $url) {
+      try {
+        $result = $this->converter->convertToImages(
+          $tmpFile,
+          $filename
+        );
+
+        $baseUrl = sprintf(
+          '%s://%s:%d/download/',
+          $this->appUrlScheme,
+          $this->appUrlHost,
+          $this->appUrlPort
+        );
+
+        $responseData = [
+          'success' => true,
+          'source_url' => $url,
+          'pages' => count($result),
+          'images' => array_map(
+            static fn($img) => $baseUrl . $img,
+            $result
+          ),
+          'timestamp' => time(),
+        ];
+
+        $response->header('Content-Type', 'application/json');
+        $response->end(json_encode($responseData));
+      } catch (Throwable $e) {
+        $this->handleError($response, $e);
+      } finally {
+        if (file_exists($tmpFile)) {
+          unlink($tmpFile);
+        }
       }
     });
   }

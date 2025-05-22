@@ -8,28 +8,30 @@ class PdfConverter
   {
     $this->uploadDir = rtrim($uploadDir, '/');
 
-    if (!is_dir($this->uploadDir)) {
-      mkdir($this->uploadDir, 0777, true);
+    if (!is_dir($this->uploadDir) && !mkdir($concurrentDirectory = $this->uploadDir, 0777, true) && !is_dir($concurrentDirectory)) {
+      throw new \RuntimeException(sprintf('Directory "%s" was not created', $concurrentDirectory));
     }
   }
 
-  public function convertToImages(string $pdfPath): array
+  public function convertToImages(string $pdfPath, string $filename): array
   {
     if (!extension_loaded('imagick')) {
       throw new RuntimeException('Imagick extension is not installed');
     }
-
-    $filename = uniqid('pdf_') . '_' . time();
     $outputImages = [];
 
     try {
       $imagick = new Imagick();
-      $imagick->setResolution(150, 150);
+      $imagick->setResolution(300, 300);
       $imagick->readImage($pdfPath);
       $imagick->setImageFormat('png');
+      $imagick->setImageCompressionQuality(100);
 
       foreach ($imagick as $i => $page) {
-        $outputPath = "{$this->uploadDir}/{$filename}_page_{$i}.png";
+        $outputPath = "{$this->uploadDir}/{$filename}.png";
+        if (count($imagick)>1) {
+          $outputPath = "{$this->uploadDir}/{$filename}-{$i}.png";
+        }
         $page->writeImage($outputPath);
         $outputImages[] = basename($outputPath);
       }

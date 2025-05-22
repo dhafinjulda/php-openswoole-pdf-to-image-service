@@ -1,0 +1,4 @@
+# Ignore everything in uploads/
+uploads/*
+# But keep .gitkeep (or .empty) to ensure the folder exists in git
+!uploads/.gitkeep
