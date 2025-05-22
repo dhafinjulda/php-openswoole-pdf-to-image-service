@@ -1,0 +1,5 @@
+<policymap>
+    <policy domain="coder" rights="read|write" pattern="PDF" />
+    <!-- You can add other policies here if needed,
+         but this line is the key for PDF processing. -->
+</policymap>

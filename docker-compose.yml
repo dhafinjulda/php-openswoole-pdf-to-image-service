@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  pdf-converter:
+    build:
+      context: .
+      dockerfile: docker/php/Dockerfile
+    ports:
+      - "9501:9501"
+    volumes:
+      - ./src:/var/www/src
+      - ./uploads:/var/www/uploads
+    environment:
+      - APP_ENV=development
+      - UPLOAD_DIR=/var/www/uploads
+      # --- Add these for configurable base URL ---
+      - APP_URL_SCHEME=http
+      - APP_URL_HOST=localhost
+      - APP_URL_PORT=9501 # This should be the port exposed to the outside world
+      # ------------------------------------------
+    restart: "no"
