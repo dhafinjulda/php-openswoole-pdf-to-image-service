@@ -1,7 +1,8 @@
 version: '3.8'
 
 services:
-  pdf-converter:
+  php-openswoole-pdf-to-image-service:
+    image: php-openswoole-pdf-to-image-service
     build:
       context: .
       dockerfile: docker/php/Dockerfile
